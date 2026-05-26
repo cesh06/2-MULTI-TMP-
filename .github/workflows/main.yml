@@ -1,3 +1,4 @@
+# FORCE RE-INDEX: Modifying the top of the file to reset GitHub's internal Actions cache
 name: Multi-Account TMP Automation
 
 on:
@@ -11,6 +12,10 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      # --- DEBUG STEP: If you see this in the logs, the queue was successful ---
+      - name: Debug Queuing
+        run: echo "Workflow successfully queued and started!"
+
       - uses: actions/checkout@v4
 
       - name: Set up Python
