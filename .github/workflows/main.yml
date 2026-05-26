@@ -1,0 +1,77 @@
+name: Multi-Account TMP Automation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 22 * * *"   # Midnight Kigali time
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers (fresh each run)
+        run: playwright install --with-deps chromium
+
+      - name: Run bot
+        env:
+          TMP_ACCOUNTS: ${{ secrets.TMP_ACCOUNTS }}
+        run: python -u bot.py
+
+      # Only upload artifacts if the bot FAILS (saves storage)
+      - name: Upload debug artifacts (on failure only)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-debug-${{ github.run_id }}
+          path: |
+            *.png
+            *.zip
+            *.html
+          if-no-files-found: ignore
+
+      # Delete artifacts older than 3 days to stay under storage limit
+      - name: Delete old artifacts
+        if: always()
+        run: |
+          echo "Deleting artifacts older than 3 days..."
+          gh api repos/${{ github.repository }}/actions/artifacts --paginate \
+            --jq '.artifacts[] | select(.expired == false) | [.id, .created_at] | @tsv' | \
+          while read -r id created; do
+            created_epoch=$(date -d "$created" +%s)
+            now_epoch=$(date +%s)
+            age_days=$(( (now_epoch - created_epoch) / 86400 ))
+            if [ $age_days -gt 3 ]; then
+              echo "Deleting artifact ID $id (created $created, age $age_days days)"
+              gh api -X DELETE repos/${{ github.repository }}/actions/artifacts/$id
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
+        continue-on-error: true
+
+      # Delete caches older than 3 days (if any remain)
+      - name: Cleanup old caches
+        if: always()
+        run: |
+          echo "Checking for caches older than 3 days..."
+          gh cache list --limit 100 --json id,key,lastAccessedAt 2>/dev/null | \
+          jq -r '.[] | select(.lastAccessedAt < (now - 259200 | strftime("%Y-%m-%dT%H:%M:%SZ"))) | .id' | \
+          while read id; do
+            echo "Deleting cache $id"
+            gh cache delete "$id"
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
+        continue-on-error: true
