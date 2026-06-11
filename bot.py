@@ -97,9 +97,11 @@ async def run_bot_for_user(page, username, password, target_tasks):
             except:
                 pass
 
+        # ================== PROGRESS CHECK (DYNAMIC TARGET) ==================
         print("📊 Checking progress...")
         progress_text = await main.inner_text("body")
-        match = re.search(r'(\d+)\s*/\s*15', progress_text)
+        # The FIX: use actual target_tasks instead of hardcoded 15
+        match = re.search(rf'(\d+)\s*/\s*{target_tasks}', progress_text)
         done = int(match.group(1)) if match else 0
         print(f"📊 Progress: {done}/{target_tasks} requested.")
 
@@ -135,10 +137,10 @@ async def run_bot_for_user(page, username, password, target_tasks):
                 print("❌ Could not find submit button. Skipping task.")
                 continue
 
-            # Wait for 100% – fewer & shorter attempts
+            # Wait for 100%
             print("⏳ Waiting for 100%...")
             success_100 = False
-            for attempt in range(5):  # reduced from 8
+            for attempt in range(5):
                 try:
                     await main.wait_for_function("() => document.body.innerText.includes('100%')", timeout=25000)
                     success_100 = True
