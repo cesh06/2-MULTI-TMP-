@@ -1,15 +1,18 @@
 name: Multi-Account TMP Automation (Two‑Run Strategy)
 
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
   schedule:
-    # Run at 22:00 UTC (00:00 Kigali) and 22:30 UTC (00:30 Kigali)
-    - cron: "0,30 22 * * *"
+    - cron: "0,30 22 * * *"    # Midnight + 00:30 Kigali (UTC 22:00, 22:30)
 
 jobs:
   run-bot:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60    # Each run fits comfortably under 60 minutes
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -28,10 +31,9 @@ jobs:
       - name: Run bot
         env:
           TMP_ACCOUNTS: ${{ secrets.TMP_ACCOUNTS }}
-          TMP_RUN_LIMIT: "15"           # Each account does at most 15 tasks per run
+          TMP_RUN_LIMIT: "15"
         run: python -u bot.py
 
-      # Only upload artifacts if the bot FAILS (saves storage)
       - name: Upload debug artifacts (on failure only)
         if: failure()
         uses: actions/upload-artifact@v4
@@ -43,7 +45,6 @@ jobs:
             *.html
           if-no-files-found: ignore
 
-      # Delete artifacts older than 3 days to stay under storage limit
       - name: Delete old artifacts
         if: always()
         run: |
@@ -63,7 +64,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         continue-on-error: true
 
-      # Delete caches older than 3 days (if any remain)
       - name: Cleanup old caches
         if: always()
         run: |
