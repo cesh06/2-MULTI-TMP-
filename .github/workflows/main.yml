@@ -1,14 +1,15 @@
-name: Multi-Account TMP Automation
+name: Multi-Account TMP Automation (Two‑Run Strategy)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 22 * * *"   # Midnight Kigali time
+    # Run at 22:00 UTC (00:00 Kigali) and 22:30 UTC (00:30 Kigali)
+    - cron: "0,30 22 * * *"
 
 jobs:
   run-bot:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 60    # Each run fits comfortably under 60 minutes
 
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +28,7 @@ jobs:
       - name: Run bot
         env:
           TMP_ACCOUNTS: ${{ secrets.TMP_ACCOUNTS }}
+          TMP_RUN_LIMIT: "15"           # Each account does at most 15 tasks per run
         run: python -u bot.py
 
       # Only upload artifacts if the bot FAILS (saves storage)
