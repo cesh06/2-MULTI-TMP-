@@ -12,6 +12,9 @@ ACCOUNTS_DATA = os.getenv("TMP_ACCOUNTS")
 if not ACCOUNTS_DATA:
     raise ValueError("TMP_ACCOUNTS must be set in GitHub Secrets")
 
+# NEW: Per‑run task cap (default 15 if not set in workflow)
+RUN_LIMIT = int(os.getenv("TMP_RUN_LIMIT", "15"))
+
 TMP_LOGIN_URL = "https://tmpjob.net/login"
 TASK_CENTER_URL = "https://tmpjob.net/index/rotary/index.html"
 
@@ -24,7 +27,6 @@ def cleanup_old_screenshots():
         except:
             pass
     print("✅ Storage cleanup completed")
-
 # ============================================================
 
 async def safe_click(page, selectors, timeout=8000):
@@ -51,7 +53,7 @@ async def is_logged_in(page_or_frame):
 
 async def close_any_popup(main):
     for popup_selectors in [
-        ["text=Gufunga", "button:has-text('Gufunga')"],                # Type 1: Announcement modal (Itangazo)
+        ["text=Gufunga", "button:has-text('Gufunga')"],                # Type 1: Announcement modal
         ["button:has-text('X')", ".close", "[aria-label='Close']", ".modal-close"]  # Type 2: Generic popup
     ]:
         closed = await safe_click(main, popup_selectors, timeout=3000)
@@ -89,7 +91,6 @@ async def run_bot_for_user(page, username, password, target_tasks):
 
         print("✅ Login successful!")
 
-        # Close any post-login popup
         await close_any_popup(main)
 
         print("🧭 Clicking 'Inshingano' nav item...")
@@ -98,7 +99,6 @@ async def run_bot_for_user(page, username, password, target_tasks):
             await page.goto(TASK_CENTER_URL, wait_until="networkidle")
             await asyncio.sleep(5)
 
-        # Ensure right context
         try:
             await main.wait_for_selector(":has-text('Iterambere ry\\'imirimo')", timeout=10000)
         except:
@@ -111,7 +111,6 @@ async def run_bot_for_user(page, username, password, target_tasks):
 
         print("📊 Checking progress...")
         progress_text = await main.inner_text("body")
-        # ===== FIXED: Use dynamic target from secrets =====
         match = re.search(rf'(\d+)\s*/\s*{target_tasks}', progress_text)
         done = int(match.group(1)) if match else 0
         print(f"📊 Progress: {done}/{target_tasks} requested.")
@@ -120,10 +119,13 @@ async def run_bot_for_user(page, username, password, target_tasks):
             print(f"🎉 All requested tasks completed for {username}!")
             return True
 
-        for i in range(done + 1, target_tasks + 1):
+        # ========== APPLY RUN LIMIT ==========
+        max_task_this_run = min(target_tasks, done + RUN_LIMIT)
+        print(f"⏳ This run will complete tasks up to {max_task_this_run} (limit {RUN_LIMIT})")
+
+        for i in range(done + 1, max_task_this_run + 1):
             print(f"\n🚀 Task {i}/{target_tasks}")
 
-            # Context check
             try:
                 await main.wait_for_selector("text=Shaka gahunda", timeout=5000)
             except:
