@@ -1,5 +1,9 @@
-name: Multi-Account TMP Automation (Two‑Run Strategy)
+name: Multi-Account TMP Automation (Two-Run Strategy)
 
+# ─── CONCURRENCY GUARD ──────────────────────────────────────────────────────
+# If Run 1 is still active when Run 2 is triggered at 00:30,
+# Run 2 is QUEUED (not cancelled). It starts the moment Run 1 finishes.
+# This guarantees the same account is NEVER logged in from two sessions at once.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
@@ -7,7 +11,8 @@ concurrency:
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0,30 22 * * *"    # Midnight + 00:30 Kigali (UTC 22:00, 22:30)
+    # Midnight and 00:30 Kigali time  (UTC+2 → 22:00 and 22:30 UTC)
+    - cron: "0,30 22 * * *"
 
 jobs:
   run-bot:
@@ -25,16 +30,32 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Install Playwright browsers (fresh each run)
+      # Fresh Playwright install every run (no cache) — avoids stale browser issues
+      - name: Install Playwright browsers
         run: playwright install --with-deps chromium
 
       - name: Run bot
         env:
           TMP_ACCOUNTS: ${{ secrets.TMP_ACCOUNTS }}
+          # Each account does at most 15 tasks per run.
+          # Run 1: 30-task accounts do  1-15, small accounts (5/8) finish entirely.
+          # Run 2: 30-task accounts do 16-30, small accounts are auto-skipped (done).
           TMP_RUN_LIMIT: "15"
         run: python -u bot.py
 
-      - name: Upload debug artifacts (on failure only)
+      # ── JOB SUMMARY (visible in GitHub Actions UI) ──────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "## TMP Bot — $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ Run finished successfully." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Run failed or timed out. Check logs and debug artifacts." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # Upload screenshots only when the run fails
+      - name: Upload debug artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -45,34 +66,34 @@ jobs:
             *.html
           if-no-files-found: ignore
 
-      - name: Delete old artifacts
+      # ── STORAGE CLEANUP (keeps GitHub storage under 500 MB) ─────────────────
+      - name: Delete artifacts older than 3 days
         if: always()
         run: |
-          echo "Deleting artifacts older than 3 days..."
+          echo "Cleaning artifacts older than 3 days…"
           gh api repos/${{ github.repository }}/actions/artifacts --paginate \
             --jq '.artifacts[] | select(.expired == false) | [.id, .created_at] | @tsv' | \
-          while read -r id created; do
-            created_epoch=$(date -d "$created" +%s)
-            now_epoch=$(date +%s)
-            age_days=$(( (now_epoch - created_epoch) / 86400 ))
-            if [ $age_days -gt 3 ]; then
-              echo "Deleting artifact ID $id (created $created, age $age_days days)"
-              gh api -X DELETE repos/${{ github.repository }}/actions/artifacts/$id
+          while IFS=$'\t' read -r id created; do
+            age=$(( ( $(date +%s) - $(date -d "$created" +%s) ) / 86400 ))
+            if [ "$age" -gt 3 ]; then
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" \
+                && echo "  Deleted artifact $id (${age}d old)"
             fi
           done
         env:
           GH_TOKEN: ${{ github.token }}
         continue-on-error: true
 
-      - name: Cleanup old caches
+      - name: Delete caches older than 3 days
         if: always()
         run: |
-          echo "Checking for caches older than 3 days..."
-          gh cache list --limit 100 --json id,key,lastAccessedAt 2>/dev/null | \
-          jq -r '.[] | select(.lastAccessedAt < (now - 259200 | strftime("%Y-%m-%dT%H:%M:%SZ"))) | .id' | \
-          while read id; do
-            echo "Deleting cache $id"
-            gh cache delete "$id"
+          echo "Cleaning caches older than 3 days…"
+          CUTOFF=$(date -d '3 days ago' -u +%Y-%m-%dT%H:%M:%SZ)
+          gh cache list --limit 100 --json id,lastAccessedAt 2>/dev/null | \
+          jq -r --arg cutoff "$CUTOFF" \
+            '.[] | select(.lastAccessedAt < $cutoff) | .id' | \
+          while read -r id; do
+            gh cache delete "$id" && echo "  Deleted cache $id"
           done
         env:
           GH_TOKEN: ${{ github.token }}
