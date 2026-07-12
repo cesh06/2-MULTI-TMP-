@@ -1,18 +1,11 @@
-name: Multi-Account TMP Automation (Two-Run Strategy)
-
-# ─── CONCURRENCY GUARD ──────────────────────────────────────────────────────
-# If Run 1 is still active when Run 2 is triggered at 00:30,
-# Run 2 is QUEUED (not cancelled). It starts the moment Run 1 finishes.
-# This guarantees the same account is NEVER logged in from two sessions at once.
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: false
+name: TMP Multi-Account Automation
 
 on:
   workflow_dispatch:
   schedule:
-    # Midnight and 00:30 Kigali time  (UTC+2 → 22:00 and 22:30 UTC)
-    - cron: "0,30 22 * * *"
+    # Once per night — midnight Kigali time (UTC+2 → 22:00 UTC)
+    # All accounts run in parallel; 30 tasks each finishes in ~30 min.
+    - cron: "0 22 * * *"
 
 jobs:
   run-bot:
@@ -30,31 +23,30 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Fresh Playwright install every run (no cache) — avoids stale browser issues
+      # Fresh browser install every run — avoids stale binary issues
       - name: Install Playwright browsers
         run: playwright install --with-deps chromium
 
       - name: Run bot
         env:
           TMP_ACCOUNTS: ${{ secrets.TMP_ACCOUNTS }}
-          # Each account does at most 15 tasks per run.
-          # Run 1: 30-task accounts do  1-15, small accounts (5/8) finish entirely.
-          # Run 2: 30-task accounts do 16-30, small accounts are auto-skipped (done).
-          TMP_RUN_LIMIT: "15"
+          # 30 = full daily quota in one run.
+          # Lower to 15 here if you ever need to revert to a two-run split.
+          TMP_RUN_LIMIT: "30"
         run: python -u bot.py
 
-      # ── JOB SUMMARY (visible in GitHub Actions UI) ──────────────────────────
+      # ── JOB SUMMARY — visible in the GitHub Actions UI ──────────────────────
       - name: Write job summary
         if: always()
         run: |
           echo "## TMP Bot — $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
           if [ "${{ job.status }}" = "success" ]; then
-            echo "✅ Run finished successfully." >> $GITHUB_STEP_SUMMARY
+            echo "✅ All accounts finished successfully." >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ Run failed or timed out. Check logs and debug artifacts." >> $GITHUB_STEP_SUMMARY
+            echo "❌ Run failed or timed out — check logs and debug artifacts below." >> $GITHUB_STEP_SUMMARY
           fi
 
-      # Upload screenshots only when the run fails
+      # Upload screenshots only when something goes wrong
       - name: Upload debug artifacts
         if: failure()
         uses: actions/upload-artifact@v4
@@ -66,11 +58,11 @@ jobs:
             *.html
           if-no-files-found: ignore
 
-      # ── STORAGE CLEANUP (keeps GitHub storage under 500 MB) ─────────────────
+      # ── STORAGE CLEANUP — keeps GitHub well under the 500 MB limit ───────────
       - name: Delete artifacts older than 3 days
         if: always()
         run: |
-          echo "Cleaning artifacts older than 3 days…"
+          echo "🧹 Cleaning artifacts older than 3 days…"
           gh api repos/${{ github.repository }}/actions/artifacts --paginate \
             --jq '.artifacts[] | select(.expired == false) | [.id, .created_at] | @tsv' | \
           while IFS=$'\t' read -r id created; do
@@ -87,7 +79,7 @@ jobs:
       - name: Delete caches older than 3 days
         if: always()
         run: |
-          echo "Cleaning caches older than 3 days…"
+          echo "🧹 Cleaning caches older than 3 days…"
           CUTOFF=$(date -d '3 days ago' -u +%Y-%m-%dT%H:%M:%SZ)
           gh cache list --limit 100 --json id,lastAccessedAt 2>/dev/null | \
           jq -r --arg cutoff "$CUTOFF" \
