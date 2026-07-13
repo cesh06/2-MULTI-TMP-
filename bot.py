@@ -1,23 +1,3 @@
-"""
-TMP Multi-Account Bot — Final Production Version
-=================================================
-Strategy: ONE run per night. All accounts run IN PARALLEL.
-
-• 30-task accounts → all 30 tasks done in ~30 min (one run, one night).
-• 5/8-task accounts → finish in ~5–8 min, context closes, done.
-• No two-run split. No queueing. No session overlap.
-
-Session safety:
-  • Each account gets its own isolated browser context (own cookies, zero bleed).
-  • Logins are staggered (5–15 s apart) so TMP never sees 4 hits at the exact same second.
-  • asyncio.gather() collects all results even if one account crashes.
-
-Secret format (TMP_ACCOUNTS):
-  phone1:pass1:tasks1,phone2:pass2:tasks2,...
-  Example:
-  794968772:Password1:30,786763840:Password2:30,791377506:Password3:8,732749495:Password4:5
-"""
-
 import asyncio
 import os
 import random
@@ -28,299 +8,226 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Environment ───────────────────────────────────────────────────────────────
-ACCOUNTS_RAW = os.getenv("TMP_ACCOUNTS")
-if not ACCOUNTS_RAW:
-    raise ValueError(
-        "TMP_ACCOUNTS is not set.\n"
-        "Format: phone:pass:tasks,phone:pass:tasks,..."
-    )
-
-RUN_LIMIT = int(os.getenv("TMP_RUN_LIMIT", "30"))
+# ── Multi‑account secret ────────────────────────────────────────────────────
+ACCOUNTS_DATA = os.getenv("TMP_ACCOUNTS")
+if not ACCOUNTS_DATA:
+    raise ValueError("TMP_ACCOUNTS must be set.\nFormat: phone:pass:tasks,phone:pass:tasks,...")
 
 TMP_LOGIN_URL   = "https://tmpjob.net/login"
 TASK_CENTER_URL = "https://tmpjob.net/index/rotary/index.html"
 
-MAX_CTX_RETRIES  = 3
-MAX_TASK_RETRIES = 2
-
+# Stagger logins (seconds) – account 0 starts immediately, each next waits 5‑15 s extra.
 STAGGER_MIN = 5
 STAGGER_MAX = 15
 
-
-def cleanup_old_screenshots() -> None:
-    removed = 0
-    for f in glob.glob("*.png"):
+# ====================== STORAGE CLEANUP ======================
+def cleanup_old_screenshots():
+    for file in glob.glob("*.png"):
         try:
-            os.remove(f)
-            removed += 1
-        except OSError:
+            os.remove(file)
+            print(f"🧹 Cleaned old screenshot: {file}")
+        except:
             pass
-    print(f"🧹 Removed {removed} old screenshot(s).\n")
+    print("✅ Storage cleanup completed")
+# ============================================================
 
-
-async def get_active_context(page, probe="text=Shaka gahunda"):
-    for attempt in range(MAX_CTX_RETRIES):
-        try:
-            await page.wait_for_selector(probe, timeout=3000)
-            return page
-        except PlaywrightTimeout:
-            pass
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            try:
-                await frame.wait_for_selector(probe, timeout=2000)
-                return frame
-            except PlaywrightTimeout:
-                continue
-        if attempt < MAX_CTX_RETRIES - 1:
-            print(f"      🔄 Context probe attempt {attempt + 1}/{MAX_CTX_RETRIES}…")
-            await asyncio.sleep(2)
-    frames = page.frames
-    print("      ⚠️ Probe not found — using fallback context.")
-    return frames[1] if len(frames) > 1 else page
-
-
-async def get_login_context(page):
-    try:
-        await page.wait_for_selector("input", timeout=10000)
-        return page
-    except PlaywrightTimeout:
-        pass
-    iframe_el = await page.wait_for_selector("iframe", timeout=15000)
-    return await iframe_el.content_frame()
-
-
-async def safe_click(ctx, selectors, timeout=8000) -> bool:
+async def safe_click(page, selectors, timeout=8000):
     if isinstance(selectors, str):
         selectors = [selectors]
-    for sel in selectors:
+    for selector in selectors:
         try:
-            await ctx.wait_for_selector(sel, state="visible", timeout=timeout)
-            await ctx.click(sel, force=True)
-            await asyncio.sleep(random.uniform(0.4, 0.9))
+            await page.wait_for_selector(selector, state="visible", timeout=timeout)
+            await page.click(selector, force=True)
+            await asyncio.sleep(random.uniform(0.5, 1.0))
             return True
         except PlaywrightTimeout:
             continue
     return False
 
-
-async def wait_idle(page, timeout=12000) -> None:
+async def is_logged_in(page_or_frame):
     try:
-        await page.wait_for_load_state("networkidle", timeout=timeout)
-    except PlaywrightTimeout:
-        pass
-
-
-async def is_logged_in(ctx) -> bool:
-    try:
-        text = await ctx.inner_text("body")
-        phrases = [
-            "Iterambere ry'imirimo",
-            "Shaka gahunda",
-            "Shaka komisiyo uyu munsi",
-            "Kubitsa",
-            "Impano zidasanzwe",
-            "Genda kwakira igihembo",
-        ]
-        return any(p in text for p in phrases)
-    except Exception:
+        text = await page_or_frame.inner_text("body")
+        phrases = ["Iterambere ry'imirimo", "Shaka gahunda", "Shaka komisiyo uyu munsi",
+                   "Kubitsa", "Gukuramo", "Impano zidasanzwe", "Amahirwe Roulette", "Genda kwakira igihembo"]
+        return any(phrase in text for phrase in phrases)
+    except:
         return False
 
-
-async def close_any_popup(ctx) -> None:
-    popup_groups = [
+async def close_any_popup(main):
+    for popup_selectors in [
         ["text=Gufunga", "button:has-text('Gufunga')"],
-        ["button:has-text('X')", ".close", "[aria-label='Close']",
-         ".modal-close", ".popup-close"],
-    ]
-    for selectors in popup_groups:
-        if await safe_click(ctx, selectors, timeout=3000):
-            print("      🔒 Pop-up dismissed.")
-            await asyncio.sleep(1)
-            return
-    print("      ℹ️ No pop-up found.")
-
-
-async def go_to_task_center(page) -> None:
-    clicked = await safe_click(
-        page,
-        ["text=Inshingano", ".bottom-nav > a:nth-child(2)"],
-        timeout=8000,
-    )
-    if not clicked:
-        print("      ⚠️ Nav button not found — loading Task Center URL.")
-        await page.goto(TASK_CENTER_URL, wait_until="domcontentloaded", timeout=30000)
-    await wait_idle(page)
-
-
-async def run_single_task(page, task_num: int, target: int, tag: str) -> bool:
-    print(f"{tag} 🚀 Task {task_num}/{target}")
-    ctx = await get_active_context(page)
-
-    if not await safe_click(
-        ctx,
-        ["text=Shaka gahunda", 'button:has-text("Shaka gahunda")'],
-        timeout=20000,
-    ):
-        print(f"{tag}    ❌ 'Shaka gahunda' not found.")
-        return False
-
-    await wait_idle(page, 8000)
-
-    confirmed = await safe_click(
-        ctx, ["text=Nibyo", "button:has-text('Nibyo')"], timeout=7000
-    )
-    if not confirmed:
-        print(f"{tag}    ⚠️ Confirmation button not found — continuing anyway.")
-    await asyncio.sleep(random.uniform(1.5, 2.5))
-
-    if not await safe_click(
-        ctx,
-        ["text=Tanga icyifuzo", "text=Tanga inshingano", ".button-fill"],
-        timeout=15000,
-    ):
-        print(f"{tag}    ❌ Submit button not found.")
-        return False
-
-    print(f"{tag}    ⏳ Waiting for 100%…")
-    reached = False
-    for attempt in range(6):
-        try:
-            await ctx.wait_for_function(
-                "() => document.body.innerText.includes('100%')",
-                timeout=20000,
-            )
-            reached = True
+        ["button:has-text('X')", ".close", "[aria-label='Close']", ".modal-close"]
+    ]:
+        closed = await safe_click(main, popup_selectors, timeout=3000)
+        if closed:
+            print("   🔒 Popup closed.")
             break
-        except Exception:
-            print(f"{tag}    …waiting (attempt {attempt + 1}/6)…")
-            await asyncio.sleep(4)
+    else:
+        print("   ℹ️ No popup detected, proceeding.")
 
-    if not reached:
-        print(f"{tag}    ⚠️ 100% not reached — aborting task.")
-        return False
+# ──────────────────────────── PER‑ACCOUNT WORKER ────────────────────────────
+async def run_account_worker(phone, password, target_tasks, stagger_delay):
+    """
+    Exactly the same logic as the reliable single‑account bot,
+    but wrapped to be called concurrently with its own context.
+    """
+    tag = f"[{phone}]"
 
-    await asyncio.sleep(1)
-    await safe_click(ctx, ["text=Tanga inshingano", ".button-fill"], timeout=10000)
-    print(f"{tag}    ✅ Task {task_num} done.")
-    return True
-
-
-async def run_account(
-    browser,
-    username: str,
-    password: str,
-    target_tasks: int,
-    stagger_delay: float = 0.0,
-) -> dict:
-    tag = f"[{username}]"
-    stats = {"completed": 0, "failed": 0, "skipped": False}
-
+    # Stagger login
     if stagger_delay > 0:
         print(f"{tag} ⏱️ Waiting {stagger_delay:.0f}s before login (stagger)…")
         await asyncio.sleep(stagger_delay)
 
+    # ── Fresh isolated context ───────────────────────────────────────────
     context = await browser.new_context(
         viewport={"width": 412, "height": 915},
         is_mobile=True,
-        user_agent=(
-            "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/116.0.0.0 Mobile Safari/537.36"
-        ),
+        user_agent="Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
     )
     page = await context.new_page()
 
     try:
-        print(f"\n{'─'*55}\n{tag} Target: {target_tasks} tasks\n{'─'*55}")
+        print(f"{tag} ───────────────────────────────────────")
+        print(f"{tag} Target: {target_tasks} tasks")
+        print(f"{tag} ───────────────────────────────────────")
+
+        # ── LOGIN ─────────────────────────────────────────────────────────
+        print(f"{tag} 🔐 Opening TMP login…")
         await page.goto(TMP_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        main = page
 
-        login_ctx = await get_login_context(page)
-        await login_ctx.locator("input").nth(0).fill(username)
-        await login_ctx.locator("input").nth(1).fill(password)
-        await safe_click(login_ctx, ["button", ".login-button"])
-        print(f"{tag} 👆 Credentials submitted — waiting for dashboard…")
+        try:
+            await page.wait_for_selector("input", timeout=10000)
+        except:
+            iframe_element = await page.wait_for_selector("iframe", timeout=15000)
+            main = await iframe_element.content_frame()
 
-        await wait_idle(page, 30000)
-        await asyncio.sleep(4)
+        await main.locator("input").nth(0).fill(phone)
+        await main.locator("input").nth(1).fill(password)
+        await safe_click(main, ["button", ".login-button"])
+        print(f"{tag} 👆 Login submitted.")
 
-        if not await is_logged_in(login_ctx):
+        print(f"{tag} ⏳ Waiting for successful login…")
+        await asyncio.sleep(10)
+        if not await is_logged_in(main):
             await asyncio.sleep(5)
-            if not await is_logged_in(login_ctx):
-                print(f"{tag} ❌ LOGIN FAILED — check the password in TMP_ACCOUNTS secret.")
-                await page.screenshot(path=f"login_failed_{username}.png")
-                return stats
+            if not await is_logged_in(main):
+                print(f"{tag} ❌ LOGIN FAILED — Check password in secrets")
+                await page.screenshot(path=f"login_failed_{phone}.png")
+                return
 
-        print(f"{tag} ✅ Logged in successfully.")
-        await close_any_popup(login_ctx)
+        print(f"{tag} ✅ Login successful!")
+        await close_any_popup(main)
 
-        nav_ok = await safe_click(
-            login_ctx,
-            ["text=Inshingano", ".bottom-nav > a:nth-child(2)"],
-            timeout=15000,
-        )
-        if not nav_ok:
-            await page.goto(TASK_CENTER_URL, wait_until="networkidle", timeout=30000)
-        await wait_idle(page)
-        await asyncio.sleep(3)
+        # ── NAVIGATE TO TASK CENTER ───────────────────────────────────────
+        print(f"{tag} 🧭 Clicking 'Inshingano' nav item…")
+        nav_clicked = await safe_click(main, ["text=Inshingano", ".bottom-nav > a:nth-child(2)"], timeout=15000)
+        if not nav_clicked:
+            await page.goto(TASK_CENTER_URL, wait_until="networkidle")
+            await asyncio.sleep(5)
 
-        ctx = await get_active_context(page)
-        body = await ctx.inner_text("body")
-        match = re.search(rf'(\d+)\s*/\s*{target_tasks}', body)
+        # Ensure we are in the right context (iframe or main)
+        try:
+            await main.wait_for_selector(":has-text('Iterambere ry\\'imirimo')", timeout=10000)
+        except:
+            try:
+                iframe_el = await page.wait_for_selector("iframe", timeout=8000)
+                main = await iframe_el.content_frame()
+                print("   🔄 Switched to iframe.")
+            except:
+                pass
+
+        # ── PROGRESS CHECK ─────────────────────────────────────────────────
+        print(f"{tag} 📊 Checking progress…")
+        progress_text = await main.inner_text("body")
+        match = re.search(rf'(\d+)\s*/\s*{target_tasks}', progress_text)
         done = int(match.group(1)) if match else 0
         print(f"{tag} 📊 Progress: {done}/{target_tasks}")
 
         if done >= target_tasks:
-            print(f"{tag} 🎉 All {target_tasks} tasks already complete — skipping.")
-            stats["skipped"] = True
-            return stats
+            print(f"{tag} 🎉 All tasks already completed — skipping.")
+            return
 
-        ceiling = min(target_tasks, done + RUN_LIMIT)
-        print(f"{tag} 📋 Will complete tasks {done + 1} → {ceiling} (cap={RUN_LIMIT})")
+        # ── TASK LOOP ─────────────────────────────────────────────────────
+        for i in range(done + 1, target_tasks + 1):
+            print(f"\n{tag} 🚀 Task {i}/{target_tasks}")
 
-        for i in range(done + 1, ceiling + 1):
-            task_ok = False
-            for attempt in range(MAX_TASK_RETRIES):
+            # Re‑detect context before each task
+            try:
+                await main.wait_for_selector("text=Shaka gahunda", timeout=5000)
+            except:
                 try:
-                    task_ok = await run_single_task(page, i, target_tasks, tag)
-                    if task_ok:
-                        stats["completed"] += 1
-                        break
-                except Exception as e:
-                    print(f"{tag}    ⚠️ Task {i} raised exception (attempt {attempt + 1}): {e}")
-                    await page.screenshot(path=f"err_{username}_t{i}_a{attempt + 1}.png")
+                    iframe_el = await page.wait_for_selector("iframe", timeout=8000)
+                    main = await iframe_el.content_frame()
+                    print("   🔄 Re‑switched to iframe.")
+                except:
+                    main = page
 
-                if attempt < MAX_TASK_RETRIES - 1:
-                    print(f"{tag}    ↩️ Recovering — going back to Task Center…")
-                    await go_to_task_center(page)
-                    await asyncio.sleep(3)
+            if not await safe_click(main, ["text=Shaka gahunda", 'button:has-text("Shaka gahunda")'], timeout=20000):
+                print(f"{tag} ⚠️ Shaka gahunda not found. Reloading Task Center…")
+                await page.goto(TASK_CENTER_URL, wait_until="domcontentloaded")
+                await asyncio.sleep(4)
+                continue
 
-            if not task_ok:
-                stats["failed"] += 1
-                print(f"{tag}    ⛔ Task {i} failed after {MAX_TASK_RETRIES} attempts — skipping.")
-
-            await go_to_task_center(page)
+            await asyncio.sleep(random.uniform(3, 5))
+            await safe_click(main, ["text=Nibyo", "button:has-text('Nibyo')"], timeout=7000)
             await asyncio.sleep(2)
 
-        print(f"{tag} 🏁 Finished!  ✅ {stats['completed']} done  ❌ {stats['failed']} failed")
+            if not await safe_click(main, ["text=Tanga icyifuzo", "text=Tanga inshingano", ".button-fill"], timeout=15000):
+                print(f"{tag} ❌ Could not find submit button. Skipping task.")
+                continue
+
+            print(f"{tag} ⏳ Waiting for 100%…")
+            success_100 = False
+            for attempt in range(5):
+                try:
+                    await main.wait_for_function("() => document.body.innerText.includes('100%')", timeout=25000)
+                    success_100 = True
+                    break
+                except:
+                    print(f"...waiting (attempt {attempt+1})…")
+                    await asyncio.sleep(4)
+
+            if not success_100:
+                print(f"{tag} ⚠️ 100% not reached. Moving on.")
+                await page.goto(TASK_CENTER_URL, wait_until="domcontentloaded")
+                continue
+
+            await asyncio.sleep(2)
+            await safe_click(main, ["text=Tanga inshingano", ".button-fill"], timeout=10000)
+            print(f"{tag} ✅ Task {i} completed.")
+
+            print(f"{tag} 🔁 Returning to Task Center…")
+            clicked_nav = await safe_click(page, ["text=Inshingano", ".bottom-nav > a:nth-child(2)"], timeout=8000)
+            if not clicked_nav:
+                await page.goto(TASK_CENTER_URL, wait_until="domcontentloaded")
+                await asyncio.sleep(4)
+            main = page
+            try:
+                await page.wait_for_selector("text=Shaka gahunda", timeout=5000)
+            except:
+                try:
+                    iframe_el = await page.wait_for_selector("iframe", timeout=8000)
+                    main = await iframe_el.content_frame()
+                except:
+                    pass
+
+        print(f"{tag} 🏁 All tasks done!")
 
     except Exception as e:
-        print(f"{tag} ❌ Unhandled crash: {e}")
-        await page.screenshot(path=f"crash_{username}.png")
-
+        print(f"{tag} ❌ Error: {e}")
+        await page.screenshot(path=f"error_{phone}.png")
     finally:
         await context.close()
 
-    return stats
 
-
-async def main() -> None:
+# ──────────────────────────── MAIN ────────────────────────────
+async def main():
     cleanup_old_screenshots()
 
-    accounts: list[tuple[str, str, int]] = []
-    for entry in ACCOUNTS_RAW.split(","):
+    # Parse TMP_ACCOUNTS: "phone:pass:tasks,phone:pass:tasks,..."
+    accounts = []
+    for entry in ACCOUNTS_DATA.split(","):
         parts = entry.strip().split(":")
         if len(parts) == 3:
             try:
@@ -328,53 +235,36 @@ async def main() -> None:
             except ValueError:
                 print(f"⚠️ Bad task count in {entry!r} — skipping.")
         else:
-            print(f"⚠️ Malformed entry {entry!r} (expected phone:pass:tasks) — skipping.")
+            print(f"⚠️ Malformed entry {entry!r} — expected phone:pass:tasks — skipping.")
 
     if not accounts:
-        print("❌ No valid accounts found. Exiting.")
+        print("❌ No valid accounts. Exiting.")
         return
 
-    print(f"📋 {len(accounts)} account(s) loaded.  RUN_LIMIT = {RUN_LIMIT}")
+    print(f"📋 {len(accounts)} account(s) loaded.")
     print(f"⚡ All accounts will run IN PARALLEL with staggered logins.\n")
 
+    global browser
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
 
-        coroutines = []
+        # Build coroutines with cumulative stagger delay
+        coros = []
         cumulative_delay = 0.0
-        for username, password, target_tasks in accounts:
-            coroutines.append(
-                run_account(browser, username, password, target_tasks, cumulative_delay)
-            )
+        for phone, password, target in accounts:
+            coros.append(run_account_worker(phone, password, target, cumulative_delay))
             cumulative_delay += random.uniform(STAGGER_MIN, STAGGER_MAX)
 
-        results = await asyncio.gather(*coroutines, return_exceptions=True)
+        # Run all concurrently – one account crash doesn't stop the others
+        await asyncio.gather(*coros, return_exceptions=True)
 
         await browser.close()
 
-    total_completed = 0
-    total_failed    = 0
-    total_skipped   = 0
-
-    for idx, result in enumerate(results):
-        uname = accounts[idx][0]
-        if isinstance(result, Exception):
-            print(f"❌ Account {uname} crashed: {result}")
-            total_failed += 1
-        elif isinstance(result, dict):
-            total_completed += result.get("completed", 0)
-            total_failed    += result.get("failed", 0)
-            if result.get("skipped"):
-                total_skipped += 1
-
     print(f"\n{'═'*55}")
     print("🏁 All accounts finished!")
-    print(f"   ✅ Tasks completed  : {total_completed}")
-    print(f"   ❌ Tasks failed     : {total_failed}")
-    print(f"   ⏭️  Accounts skipped : {total_skipped}  (already done or login failed)")
     print(f"{'═'*55}")
 
 
